@@ -1,9 +1,9 @@
 """Classes for specific report types."""
 from datetime import datetime, timedelta
 
-from flask import jsonify
+from flask import jsonify, current_app
 from pytz import timezone
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, or_
 from sqlalchemy.dialects.postgresql import INTERVAL
 from sqlalchemy.orm import aliased
 
@@ -28,7 +28,7 @@ from api.utils.enums import StalenessEnum
 
 from .cdog_client import CDOGClient
 from .report_factory import ReportFactory
-
+from api.utils.util import process_data
 
 # pylint:disable=not-callable
 
@@ -39,6 +39,7 @@ class EAAnticipatedScheduleReport(ReportFactory):
     def __init__(self, filters, color_intensity):
         """Initialize the ReportFactory"""
         data_keys = [
+            "work_id",
             "phase_name",
             "date_updated",
             "project_name",
@@ -48,6 +49,7 @@ class EAAnticipatedScheduleReport(ReportFactory):
             "ea_act",
             "substitution_act",
             "project_description",
+            "report_description",
             "anticipated_decision_date",
             "additional_info",
             "ministry_name",
@@ -58,6 +60,8 @@ class EAAnticipatedScheduleReport(ReportFactory):
             "next_pecp_title",
             "next_pecp_short_description",
             "milestone_type",
+            "category_type",
+            "event_name"
         ]
         group_by = "phase_name"
         template_name = "anticipated_schedule.docx"
@@ -66,6 +70,7 @@ class EAAnticipatedScheduleReport(ReportFactory):
 
     def _fetch_data(self, report_date):
         """Fetches the relevant data for EA Anticipated Schedule Report"""
+        current_app.logger.info(f"Fetching data for {self.report_title} report")
         start_date = report_date + timedelta(days=-7)
         report_date = report_date.astimezone(timezone('US/Pacific'))
         eac_decision_by = aliased(Staff)
@@ -77,6 +82,8 @@ class EAAnticipatedScheduleReport(ReportFactory):
         exclude_phase_names = []
         if self.filters and "exclude" in self.filters:
             exclude_phase_names = self.filters["exclude"]
+
+        current_app.logger.debug(f"Executing query for {self.report_title} report")
         results_qry = (
             db.session.query(Work)
             .join(Event, Event.work_id == Work.id)
@@ -120,15 +127,71 @@ class EAAnticipatedScheduleReport(ReportFactory):
             )
             # FILTER ENTRIES MATCHING MIN DATE FOR NEXT PECP OR NO WORK ENGAGEMENTS (FOR AMENDMENTS)
             .filter(
-                Work.is_active.is_(True),
-                Work.is_deleted.is_(False),
-                Work.work_state.in_(
-                    [WorkStateEnum.IN_PROGRESS.value, WorkStateEnum.SUSPENDED.value]
-                ),
-                # Filter out specific WorkPhase names
-                ~WorkPhase.name.in_(exclude_phase_names)
+              Work.is_active.is_(True),
+              Event.anticipated_date.between(report_date - timedelta(days=7), report_date + timedelta(days=366)),
+              or_(
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_type_id == 5, # EA Referral
+                        EventConfiguration.event_category_id == 1 # Milestone,
+                    )
+                  ),
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_category_id == 4, # Decision
+                        EventConfiguration.event_type_id == 14 # Minister
+                    )
+                  ),
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_category_id == 4, # Decision
+                        EventConfiguration.name != "IPD/EP Approval Decision (Day Zero)",
+                        EventConfiguration.event_type_id == 15 # CEAO
+                    )
+                  ),
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_category_id == 4, # Decision
+                        EventConfiguration.name != "IPD/EP Approval Decision (Day Zero)",
+                        EventConfiguration.name != "Revised EAC Application Acceptance Decision (Day Zero)",
+                        EventConfiguration.event_type_id == 15 # CEAO
+                    )
+                  ),
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_category_id == 4, # Decision
+                        EventConfiguration.name != "Delegation of Amendment Decision",
+                        or_(
+                          EventConfiguration.event_type_id == 15, # CEAO
+                          EventConfiguration.event_type_id == 16 # ADM
+                        )
+                    )
+                  ),
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_category_id == 4, # Decision
+                        EventConfiguration.name != "Delegation of SubStart Decision to Minister",
+                        EventConfiguration.event_type_id == 15 # CEAO
+                    )
+                  ),
+                  Event.event_configuration_id.in_(
+                    db.session.query(EventConfiguration.id).filter(
+                        EventConfiguration.event_category_id == 4, # Decision
+                        EventConfiguration.name != "Delegation of Transfer Decision to Minister",
+                        or_(
+                          EventConfiguration.event_type_id == 15, # CEAO
+                          EventConfiguration.event_type_id == 16 # ADM
+                        )
+                    )
+                  )
+              ),
+              Work.is_deleted.is_(False),
+              Work.work_state.in_([WorkStateEnum.IN_PROGRESS.value, WorkStateEnum.SUSPENDED.value]),
+              # Filter out specific WorkPhase names
+              ~WorkPhase.name.in_(exclude_phase_names)
             )
             .add_columns(
+                Work.id.label("work_id"),
                 PhaseCode.name.label("phase_name"),
                 latest_status_updates.c.posted_date.label("date_updated"),
                 Project.name.label("project_name"),
@@ -140,6 +203,7 @@ class EAAnticipatedScheduleReport(ReportFactory):
                 EAAct.name.label("ea_act"),
                 SubstitutionAct.name.label("substitution_act"),
                 Project.description.label("project_description"),
+                Work.report_description.label("report_description"),
                 (
                     Event.anticipated_date + func.cast(func.concat(Event.number_of_days, " DAYS"), INTERVAL)
                 ).label("anticipated_decision_date"),
@@ -151,6 +215,8 @@ class EAAnticipatedScheduleReport(ReportFactory):
                 eac_decision_by.full_name.label("eac_decision_by"),
                 decision_by.full_name.label("decision_by"),
                 EventConfiguration.event_type_id.label("milestone_type"),
+                EventConfiguration.event_category_id.label("category_type"),
+                EventConfiguration.name.label("event_name"),
                 func.coalesce(next_pecp_query.c.name, Event.name).label(
                     "next_pecp_title"
                 ),
@@ -166,23 +232,30 @@ class EAAnticipatedScheduleReport(ReportFactory):
 
     def generate_report(self, report_date, return_type):
         """Generates a report and returns it"""
+        current_app.logger.info(f"Generating {self.report_title} report for {report_date}")
         data = self._fetch_data(report_date)
         data = self._format_data(data)
         data = self._update_staleness(data, report_date)
-        if return_type == "json" and data:
-            return {"data": data}, None
-        if not data:
-            return {}, None
+
+        if return_type == "json" or not data:
+            return process_data(data, return_type)
+
         api_payload = {
             "report_data": data,
             "report_title": self.report_title,
             "report_date": report_date,
         }
         template = self.generate_template()
-        report_client = CDOGClient()
-        report = report_client.generate_document(
-            self.report_title, jsonify(api_payload).json, template
-        )
+        # Calls out to the common services document generation service. Make sure your envs are set properly.
+        try:
+            report_client = CDOGClient()
+            report = report_client.generate_document(self.report_title, jsonify(api_payload).json, template)
+        except EnvironmentError as e:
+            # Fall through to return empty response if CDOGClient fails, but log the error
+            current_app.logger.error(f"Error initializing CDOGClient: {e}.")
+            return {}, None
+
+        current_app.logger.info(f"Generated {self.report_title} report for {report_date}")
         return report, f"{self.report_title}_{report_date:%Y_%m_%d}.pdf"
 
     def _get_next_pcp_query(self, start_date):
